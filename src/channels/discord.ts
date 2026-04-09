@@ -6,7 +6,12 @@ import {
   TextChannel,
 } from 'discord.js';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import fs from 'fs';
+import path from 'path';
+import { pipeline } from 'stream/promises';
+import { Readable } from 'stream';
+
+import { ASSISTANT_NAME, TRIGGER_PATTERN, GROUPS_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -92,26 +97,67 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Handle attachments — store placeholders so the agent knows something was sent
+      // Handle attachments — download to group folder so the agent can read them
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map(
-          (att) => {
-            const contentType = att.contentType || '';
-            if (contentType.startsWith('image/')) {
-              return `[Image: ${att.name || 'image'}]`;
-            } else if (contentType.startsWith('video/')) {
-              return `[Video: ${att.name || 'video'}]`;
-            } else if (contentType.startsWith('audio/')) {
-              return `[Audio: ${att.name || 'audio'}]`;
-            } else {
-              return `[File: ${att.name || 'file'}]`;
+        const groups = this.opts.registeredGroups();
+        const group = groups[chatJid];
+        const groupFolder = group?.folder;
+        const attachmentLines: string[] = [];
+
+        for (const att of message.attachments.values()) {
+          const filename = att.name || `attachment-${att.id}`;
+          const contentType = att.contentType || '';
+
+          if (groupFolder) {
+            try {
+              const attDir = path.join(GROUPS_DIR, groupFolder, 'attachments');
+              fs.mkdirSync(attDir, { recursive: true });
+              const safeName = `${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+              const filePath = path.join(attDir, safeName);
+              const res = await fetch(att.url);
+              if (res.ok && res.body) {
+                await pipeline(
+                  Readable.fromWeb(res.body as any),
+                  fs.createWriteStream(filePath),
+                );
+                const containerPath = `/workspace/group/attachments/${safeName}`;
+                attachmentLines.push(
+                  `[Attachment: ${filename} → ${containerPath}]`,
+                );
+                logger.debug(
+                  { filename, filePath },
+                  'Discord attachment downloaded',
+                );
+              } else {
+                attachmentLines.push(
+                  `[Attachment: ${filename} (download failed)]`,
+                );
+              }
+            } catch (err) {
+              logger.warn(
+                { err, filename },
+                'Failed to download Discord attachment',
+              );
+              attachmentLines.push(
+                `[Attachment: ${filename} (download failed)]`,
+              );
             }
-          },
-        );
+          } else {
+            // No registered group — fall back to placeholder
+            if (contentType.startsWith('image/')) {
+              attachmentLines.push(`[Image: ${filename}]`);
+            } else if (contentType.startsWith('video/')) {
+              attachmentLines.push(`[Video: ${filename}]`);
+            } else {
+              attachmentLines.push(`[File: ${filename}]`);
+            }
+          }
+        }
+
         if (content) {
-          content = `${content}\n${attachmentDescriptions.join('\n')}`;
+          content = `${content}\n${attachmentLines.join('\n')}`;
         } else {
-          content = attachmentDescriptions.join('\n');
+          content = attachmentLines.join('\n');
         }
       }
 
