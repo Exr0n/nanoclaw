@@ -5,8 +5,8 @@ import path from 'path';
 import { google, gmail_v1 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 
-// isMain flag is used instead of MAIN_GROUP_FOLDER constant
 import { logger } from '../logger.js';
+import { firePipeEvent } from '../pipe-runtime.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -19,6 +19,9 @@ export interface GmailChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  credDir?: string; // defaults to ~/.gmail-mcp
+  jidPrefix?: string; // defaults to 'gmail'
+  pipeOnly?: boolean; // if true, never fall through to onMessage — pipes are the only path
 }
 
 interface ThreadMeta {
@@ -29,11 +32,14 @@ interface ThreadMeta {
 }
 
 export class GmailChannel implements Channel {
-  name = 'gmail';
+  name: string;
 
   private oauth2Client: OAuth2Client | null = null;
   private gmail: gmail_v1.Gmail | null = null;
   private opts: GmailChannelOpts;
+  private credDir: string;
+  private jidPrefix: string;
+  private pipeOnly: boolean;
   private pollIntervalMs: number;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private processedIds = new Set<string>();
@@ -43,17 +49,21 @@ export class GmailChannel implements Channel {
 
   constructor(opts: GmailChannelOpts, pollIntervalMs = 60000) {
     this.opts = opts;
+    this.credDir = opts.credDir || path.join(os.homedir(), '.gmail-mcp');
+    this.jidPrefix = opts.jidPrefix || 'gmail';
+    this.pipeOnly = opts.pipeOnly ?? false;
+    this.name =
+      this.jidPrefix === 'gmail' ? 'gmail' : `gmail (${this.jidPrefix})`;
     this.pollIntervalMs = pollIntervalMs;
   }
 
   async connect(): Promise<void> {
-    const credDir = path.join(os.homedir(), '.gmail-mcp');
-    const keysPath = path.join(credDir, 'gcp-oauth.keys.json');
-    const tokensPath = path.join(credDir, 'credentials.json');
+    const keysPath = path.join(this.credDir, 'gcp-oauth.keys.json');
+    const tokensPath = path.join(this.credDir, 'credentials.json');
 
     if (!fs.existsSync(keysPath) || !fs.existsSync(tokensPath)) {
       logger.warn(
-        'Gmail credentials not found in ~/.gmail-mcp/. Skipping Gmail channel. Run /add-gmail to set up.',
+        `Gmail credentials not found in ${this.credDir}/. Skipping Gmail channel. Run /add-gmail to set up.`,
       );
       return;
     }
@@ -91,9 +101,13 @@ export class GmailChannel implements Channel {
 
     // Start polling with error backoff
     const schedulePoll = () => {
-      const backoffMs = this.consecutiveErrors > 0
-        ? Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000)
-        : this.pollIntervalMs;
+      const backoffMs =
+        this.consecutiveErrors > 0
+          ? Math.min(
+              this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+              30 * 60 * 1000,
+            )
+          : this.pollIntervalMs;
       this.pollTimer = setTimeout(() => {
         this.pollForMessages()
           .catch((err) => logger.error({ err }, 'Gmail poll error'))
@@ -114,7 +128,7 @@ export class GmailChannel implements Channel {
       return;
     }
 
-    const threadId = jid.replace(/^gmail:/, '');
+    const threadId = jid.replace(new RegExp(`^${this.jidPrefix}:`), '');
     const meta = this.threadMeta.get(threadId);
 
     if (!meta) {
@@ -162,7 +176,7 @@ export class GmailChannel implements Channel {
   }
 
   ownsJid(jid: string): boolean {
-    return jid.startsWith('gmail:');
+    return jid.startsWith(`${this.jidPrefix}:`);
   }
 
   async disconnect(): Promise<void> {
@@ -210,8 +224,18 @@ export class GmailChannel implements Channel {
       this.consecutiveErrors = 0;
     } catch (err) {
       this.consecutiveErrors++;
-      const backoffMs = Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000);
-      logger.error({ err, consecutiveErrors: this.consecutiveErrors, nextPollMs: backoffMs }, 'Gmail poll failed');
+      const backoffMs = Math.min(
+        this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+        30 * 60 * 1000,
+      );
+      logger.error(
+        {
+          err,
+          consecutiveErrors: this.consecutiveErrors,
+          nextPollMs: backoffMs,
+        },
+        'Gmail poll failed',
+      );
     }
   }
 
@@ -253,7 +277,7 @@ export class GmailChannel implements Channel {
       return;
     }
 
-    const chatJid = `gmail:${threadId}`;
+    const chatJid = `${this.jidPrefix}:${threadId}`;
 
     // Cache thread metadata for replies
     this.threadMeta.set(threadId, {
@@ -264,34 +288,52 @@ export class GmailChannel implements Channel {
     });
 
     // Store chat metadata for group discovery
-    this.opts.onChatMetadata(chatJid, timestamp, subject, 'gmail', false);
-
-    // Find the main group to deliver the email notification
-    const groups = this.opts.registeredGroups();
-    const mainEntry = Object.entries(groups).find(
-      ([, g]) => g.isMain === true,
+    this.opts.onChatMetadata(
+      chatJid,
+      timestamp,
+      subject,
+      this.jidPrefix,
+      false,
     );
 
-    if (!mainEntry) {
-      logger.debug(
-        { chatJid, subject },
-        'No main group registered, skipping email',
-      );
-      return;
-    }
-
-    const mainJid = mainEntry[0];
-    const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
-
-    this.opts.onMessage(mainJid, {
-      id: messageId,
-      chat_jid: mainJid,
+    // Fire through pipe runtime — pipes decide whether to notify, trigger, or drop
+    const handled = await firePipeEvent({
+      type: 'channel_event',
+      channel: this.jidPrefix, // "gmail" or "gmail2"
+      event: 'new_message',
       sender: senderEmail,
-      sender_name: senderName,
-      content,
+      senderName,
+      subject,
+      body,
+      chatJid,
       timestamp,
-      is_from_me: false,
     });
+
+    // If no pipe handled it, fall through to default: deliver to main as notification.
+    // In pipeOnly mode, skip the fallthrough — email never triggers the agent directly.
+    if (!handled && !this.pipeOnly) {
+      const groups = this.opts.registeredGroups();
+      const mainEntry = Object.entries(groups).find(
+        ([, g]) => g.isMain === true,
+      );
+      if (mainEntry) {
+        const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
+        this.opts.onMessage(mainEntry[0], {
+          id: messageId,
+          chat_jid: mainEntry[0],
+          sender: senderEmail,
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+        });
+      }
+    } else if (!handled && this.pipeOnly) {
+      logger.debug(
+        { chatJid, from: senderName, subject },
+        'Email received, pipeOnly mode — no fallthrough',
+      );
+    }
 
     // Mark as read
     try {
@@ -305,8 +347,8 @@ export class GmailChannel implements Channel {
     }
 
     logger.info(
-      { mainJid, from: senderName, subject },
-      'Gmail email delivered to main group',
+      { chatJid, from: senderName, subject },
+      'Gmail email processed',
     );
   }
 
@@ -339,14 +381,35 @@ export class GmailChannel implements Channel {
   }
 }
 
-registerChannel('gmail', (opts: ChannelOpts) => {
-  const credDir = path.join(os.homedir(), '.gmail-mcp');
-  if (
-    !fs.existsSync(path.join(credDir, 'gcp-oauth.keys.json')) ||
-    !fs.existsSync(path.join(credDir, 'credentials.json'))
-  ) {
-    logger.warn('Gmail: credentials not found in ~/.gmail-mcp/');
-    return null;
-  }
-  return new GmailChannel(opts);
-});
+// Register Gmail accounts — each credentials directory gets its own channel instance
+const gmailAccounts: { name: string; credDir: string; jidPrefix: string }[] = [
+  {
+    name: 'gmail',
+    credDir: path.join(os.homedir(), '.gmail-mcp'),
+    jidPrefix: 'gmail',
+  },
+  {
+    name: 'gmail2',
+    credDir: path.join(os.homedir(), '.gmail-mcp-2'),
+    jidPrefix: 'gmail2',
+  },
+];
+
+for (const acct of gmailAccounts) {
+  registerChannel(acct.name, (opts: ChannelOpts) => {
+    if (
+      !fs.existsSync(path.join(acct.credDir, 'gcp-oauth.keys.json')) ||
+      !fs.existsSync(path.join(acct.credDir, 'credentials.json'))
+    ) {
+      logger.warn(`Gmail: credentials not found in ${acct.credDir}/`);
+      return null;
+    }
+    const pipeOnly = process.env.GMAIL_PIPE_ONLY === '1';
+    return new GmailChannel({
+      ...opts,
+      credDir: acct.credDir,
+      jidPrefix: acct.jidPrefix,
+      pipeOnly,
+    });
+  });
+}
