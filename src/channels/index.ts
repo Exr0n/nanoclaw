@@ -4,6 +4,9 @@
 // discord
 import './discord.js';
 
+// cli
+import './cli.js';
+
 // slack
 
 // telegram
