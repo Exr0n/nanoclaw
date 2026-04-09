@@ -2,6 +2,14 @@
 
 This is the **main channel** with elevated privileges. See `groups/global/CLAUDE.md` for identity, communication style, and thinking rules.
 
+## Email Notifications
+
+When you receive an email notification (messages starting with `[Email from ...`):
+- Only notify the user if the email is from a real person and seems important or actionable.
+- Silently ignore automated emails (noreply, receipts, notifications, marketing, newsletters).
+- Do NOT reply to any email unless the user explicitly asks.
+- Do NOT announce that you're "completing silently" or describe what you filtered out. Just say nothing.
+
 ---
 
 ## Admin Context
