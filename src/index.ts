@@ -11,10 +11,15 @@ import {
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
+import './pipe-sources/index.js';
 import {
   getChannelFactory,
   getRegisteredChannelNames,
 } from './channels/registry.js';
+import {
+  getPipeSourceFactory,
+  getRegisteredPipeSourceNames,
+} from './pipe-sources/registry.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -56,8 +61,9 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import { startPipeRuntime, stopPipeRuntime } from './pipe-runtime.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { Channel, NewMessage, PipeSource, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -70,6 +76,7 @@ let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
+const pipeSources: PipeSource[] = [];
 const queue = new GroupQueue();
 
 function loadState(): void {
@@ -487,6 +494,8 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'Shutdown signal received');
     proxyServer.close();
     await queue.shutdown(10000);
+    stopPipeRuntime();
+    for (const source of pipeSources) await source.disconnect();
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
   };
@@ -591,6 +600,32 @@ async function main(): Promise<void> {
     channels.push(channel);
     await channel.connect();
   }
+
+  startPipeRuntime({
+    sendNotification: async (jid: string, text: string) => {
+      const channel = findChannel(channels, jid);
+      if (channel) await channel.sendMessage(jid, text);
+    },
+    onMessage: channelOpts.onMessage,
+    resolveTarget: (target: string) => {
+      if (target === 'main') {
+        const mainEntry = Object.entries(registeredGroups).find(
+          ([, g]) => g.isMain,
+        );
+        return mainEntry ? mainEntry[0] : null;
+      }
+      return registeredGroups[target] ? target : null;
+    },
+  });
+
+  for (const sourceName of getRegisteredPipeSourceNames()) {
+    const factory = getPipeSourceFactory(sourceName);
+    const source = factory?.();
+    if (!source) continue;
+    pipeSources.push(source);
+    await source.connect();
+  }
+
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
