@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { Server } from 'http';
 
 import {
   ASSISTANT_NAME,
@@ -12,7 +13,9 @@ import {
 import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import './pipe-sources/index.js';
+import { CliChannel } from './channels/cli.js';
 import {
+  ChannelOpts,
   getChannelFactory,
   getRegisteredChannelNames,
 } from './channels/registry.js';
@@ -68,6 +71,9 @@ import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+const CLI_CHAT_JID = 'cli';
+const CLI_GROUP_FOLDER = 'cli';
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
@@ -165,6 +171,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const isMainGroup = group.isMain === true;
+  const closeAfterFirstResult = channel instanceof CliChannel;
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
   const missedMessages = getMessagesSince(
@@ -232,8 +239,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
+      if (closeAfterFirstResult) {
+        queue.closeStdin(chatJid);
+      } else {
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
+      }
     }
 
     if (result.status === 'success') {
@@ -349,6 +360,158 @@ async function runAgent(
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
     return 'error';
+  }
+}
+
+async function handleRemoteControl(
+  command: string,
+  chatJid: string,
+  msg: NewMessage,
+): Promise<void> {
+  const group = registeredGroups[chatJid];
+  if (!group?.isMain) {
+    logger.warn(
+      { chatJid, sender: msg.sender },
+      'Remote control rejected: not main group',
+    );
+    return;
+  }
+
+  const channel = findChannel(channels, chatJid);
+  if (!channel) return;
+
+  if (command === '/remote-control') {
+    const result = await startRemoteControl(msg.sender, chatJid, process.cwd());
+    if (result.ok) {
+      await channel.sendMessage(chatJid, result.url);
+    } else {
+      await channel.sendMessage(
+        chatJid,
+        `Remote Control failed: ${result.error}`,
+      );
+    }
+  } else {
+    const result = stopRemoteControl();
+    if (result.ok) {
+      await channel.sendMessage(chatJid, 'Remote Control session ended.');
+    } else {
+      await channel.sendMessage(chatJid, result.error);
+    }
+  }
+}
+
+function createChannelOpts(): ChannelOpts {
+  return {
+    onMessage: (chatJid: string, msg: NewMessage) => {
+      const trimmed = msg.content.trim();
+      if (trimmed === '/remote-control' || trimmed === '/remote-control-end') {
+        handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
+          logger.error({ err, chatJid }, 'Remote control command error'),
+        );
+        return;
+      }
+
+      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
+        const cfg = loadSenderAllowlist();
+        if (
+          shouldDropMessage(chatJid, cfg) &&
+          !isSenderAllowed(chatJid, msg.sender, cfg)
+        ) {
+          if (cfg.logDenied) {
+            logger.debug(
+              { chatJid, sender: msg.sender },
+              'sender-allowlist: dropping message (drop mode)',
+            );
+          }
+          return;
+        }
+      }
+
+      storeMessage(msg);
+    },
+    onChatMetadata: (
+      chatJid: string,
+      timestamp: string,
+      name?: string,
+      channel?: string,
+      isGroup?: boolean,
+    ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
+    registeredGroups: () => registeredGroups,
+  };
+}
+
+function ensureCliGroupRegistered(chatJid: string = CLI_CHAT_JID): void {
+  if (registeredGroups[chatJid]) return;
+
+  const groupDir = resolveGroupFolderPath(CLI_GROUP_FOLDER);
+  fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+
+  registeredGroups[chatJid] = {
+    name: 'CLI',
+    folder: CLI_GROUP_FOLDER,
+    trigger: TRIGGER_PATTERN.source,
+    added_at: new Date().toISOString(),
+    requiresTrigger: false,
+  };
+}
+
+async function createChannelInstance(
+  channelName: string,
+  channelOpts: ChannelOpts,
+): Promise<Channel> {
+  const factory = getChannelFactory(channelName);
+  if (!factory) throw new Error(`Channel factory not found: ${channelName}`);
+
+  const channel = factory(channelOpts);
+  if (!channel) throw new Error(`Channel unavailable: ${channelName}`);
+
+  await channel.connect();
+  channels.push(channel);
+  return channel;
+}
+
+export async function runCliChat(input: string): Promise<string> {
+  ensureContainerSystemRunning();
+  initDatabase();
+  loadState();
+
+  let proxyServer: Server | null = null;
+  try {
+    proxyServer = await startCredentialProxy(
+      CREDENTIAL_PROXY_PORT,
+      PROXY_BIND_HOST,
+    );
+  } catch (err) {
+    const code =
+      typeof err === 'object' && err && 'code' in err
+        ? String((err as { code?: string }).code)
+        : '';
+    if (code !== 'EADDRINUSE') throw err;
+  }
+
+  const channelOpts = createChannelOpts();
+  const channel = await createChannelInstance('cli', channelOpts);
+  if (!(channel instanceof CliChannel)) {
+    throw new Error('CLI channel did not initialize correctly');
+  }
+
+  ensureCliGroupRegistered();
+  channel.receiveOneShot(input, CLI_CHAT_JID);
+  queue.beginDirectRun(CLI_CHAT_JID, CLI_GROUP_FOLDER);
+
+  try {
+    const ok = await processGroupMessages(CLI_CHAT_JID);
+    if (!ok) {
+      throw new Error('CLI chat failed to process messages');
+    }
+
+    return channel.consumeOutput();
+  } finally {
+    queue.endDirectRun(CLI_CHAT_JID);
+    await channel.disconnect();
+    const idx = channels.indexOf(channel);
+    if (idx !== -1) channels.splice(idx, 1);
+    proxyServer?.close();
   }
 }
 
@@ -502,87 +665,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Handle /remote-control and /remote-control-end commands
-  async function handleRemoteControl(
-    command: string,
-    chatJid: string,
-    msg: NewMessage,
-  ): Promise<void> {
-    const group = registeredGroups[chatJid];
-    if (!group?.isMain) {
-      logger.warn(
-        { chatJid, sender: msg.sender },
-        'Remote control rejected: not main group',
-      );
-      return;
-    }
-
-    const channel = findChannel(channels, chatJid);
-    if (!channel) return;
-
-    if (command === '/remote-control') {
-      const result = await startRemoteControl(
-        msg.sender,
-        chatJid,
-        process.cwd(),
-      );
-      if (result.ok) {
-        await channel.sendMessage(chatJid, result.url);
-      } else {
-        await channel.sendMessage(
-          chatJid,
-          `Remote Control failed: ${result.error}`,
-        );
-      }
-    } else {
-      const result = stopRemoteControl();
-      if (result.ok) {
-        await channel.sendMessage(chatJid, 'Remote Control session ended.');
-      } else {
-        await channel.sendMessage(chatJid, result.error);
-      }
-    }
-  }
-
-  // Channel callbacks (shared by all channels)
-  const channelOpts = {
-    onMessage: (chatJid: string, msg: NewMessage) => {
-      // Remote control commands — intercept before storage
-      const trimmed = msg.content.trim();
-      if (trimmed === '/remote-control' || trimmed === '/remote-control-end') {
-        handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
-          logger.error({ err, chatJid }, 'Remote control command error'),
-        );
-        return;
-      }
-
-      // Sender allowlist drop mode: discard messages from denied senders before storing
-      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
-        const cfg = loadSenderAllowlist();
-        if (
-          shouldDropMessage(chatJid, cfg) &&
-          !isSenderAllowed(chatJid, msg.sender, cfg)
-        ) {
-          if (cfg.logDenied) {
-            logger.debug(
-              { chatJid, sender: msg.sender },
-              'sender-allowlist: dropping message (drop mode)',
-            );
-          }
-          return;
-        }
-      }
-      storeMessage(msg);
-    },
-    onChatMetadata: (
-      chatJid: string,
-      timestamp: string,
-      name?: string,
-      channel?: string,
-      isGroup?: boolean,
-    ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
-    registeredGroups: () => registeredGroups,
-  };
+  const channelOpts = createChannelOpts();
 
   // Create and connect all registered channels.
   // Each channel self-registers via the barrel import above.

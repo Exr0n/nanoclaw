@@ -141,6 +141,22 @@ export class GroupQueue {
     if (groupFolder) state.groupFolder = groupFolder;
   }
 
+  beginDirectRun(groupJid: string, groupFolder?: string): void {
+    const state = this.getGroup(groupJid);
+    state.active = true;
+    state.idleWaiting = false;
+    if (groupFolder) state.groupFolder = groupFolder;
+  }
+
+  endDirectRun(groupJid: string): void {
+    const state = this.getGroup(groupJid);
+    state.active = false;
+    state.idleWaiting = false;
+    state.process = null;
+    state.containerName = null;
+    state.groupFolder = null;
+  }
+
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
