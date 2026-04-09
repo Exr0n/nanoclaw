@@ -455,6 +455,17 @@ export async function processTaskIpc(
       }
       break;
 
+    case 'send_sms': {
+      const { sendSms: sms } = await import('./sms.js');
+      const smsText = (data as Record<string, unknown>).text as
+        | string
+        | undefined;
+      if (smsText) {
+        await sms(smsText);
+      }
+      break;
+    }
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }

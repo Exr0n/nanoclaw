@@ -333,6 +333,26 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+server.tool(
+  'send_sms',
+  `Send an SMS text message to Albert's phone. Use this for time-sensitive notifications that need immediate attention — e.g., urgent emails, reminders, alerts. For normal conversation, use Discord (send_message). Do NOT use SMS for routine updates.`,
+  {
+    text: z.string().describe('The SMS message body. Keep it short — SMS is for pings, not essays.'),
+  },
+  async (args) => {
+    const data = {
+      type: 'send_sms',
+      text: args.text,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'SMS sent.' }] };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
