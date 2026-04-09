@@ -92,6 +92,13 @@ export interface Channel {
   syncGroups?(force: boolean): Promise<void>;
 }
 
+export interface PipeSource {
+  name: string;
+  connect(): Promise<void>;
+  isConnected(): boolean;
+  disconnect(): Promise<void>;
+}
+
 // Callback type that channels use to deliver inbound messages
 export type OnInboundMessage = (chatJid: string, message: NewMessage) => void;
 
