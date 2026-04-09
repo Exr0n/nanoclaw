@@ -17,6 +17,7 @@ import {
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -55,6 +56,21 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+function resolveBlueBubblesContainerUrl(rawUrl?: string): string {
+  const fallback = `http://${CONTAINER_HOST_GATEWAY}:1234`;
+  if (!rawUrl) return fallback;
+
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {
+      parsed.hostname = CONTAINER_HOST_GATEWAY;
+    }
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return fallback;
+  }
 }
 
 function buildVolumeMounts(
@@ -164,7 +180,7 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Gmail credentials directory (for Gmail MCP inside the container)
+  // Gmail credentials directories (for Gmail MCP inside the container)
   const homeDir = os.homedir();
   const gmailDir = path.join(homeDir, '.gmail-mcp');
   if (fs.existsSync(gmailDir)) {
@@ -172,6 +188,23 @@ function buildVolumeMounts(
       hostPath: gmailDir,
       containerPath: '/home/node/.gmail-mcp',
       readonly: false, // MCP may need to refresh OAuth tokens
+    });
+  }
+  const gmailDir2 = path.join(homeDir, '.gmail-mcp-2');
+  if (fs.existsSync(gmailDir2)) {
+    mounts.push({
+      hostPath: gmailDir2,
+      containerPath: '/home/node/.gmail-mcp-2',
+      readonly: false,
+    });
+  }
+  // Google Calendar credentials directory (shared across accounts via GOOGLE_ACCOUNT_MODE)
+  const gcalDir = path.join(homeDir, '.gcal-mcp');
+  if (fs.existsSync(gcalDir)) {
+    mounts.push({
+      hostPath: gcalDir,
+      containerPath: '/home/node/.gcal-mcp',
+      readonly: false, // MCP refreshes tokens
     });
   }
 
@@ -229,6 +262,13 @@ function buildContainerArgs(
   containerName: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  const blueBubblesEnv = readEnvFile([
+    'BLUEBUBBLES_URL',
+    'BLUEBUBBLES_PASSWORD',
+  ]);
+  const blueBubblesUrl = resolveBlueBubblesContainerUrl(
+    blueBubblesEnv.BLUEBUBBLES_URL,
+  );
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -248,6 +288,14 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  if (blueBubblesEnv.BLUEBUBBLES_PASSWORD) {
+    args.push('-e', `BLUEBUBBLES_URL=${blueBubblesUrl}`);
+    args.push(
+      '-e',
+      `BLUEBUBBLES_PASSWORD=${blueBubblesEnv.BLUEBUBBLES_PASSWORD}`,
+    );
   }
 
   // Runtime-specific args for host gateway resolution
