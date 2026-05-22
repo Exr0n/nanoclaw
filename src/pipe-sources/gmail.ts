@@ -128,7 +128,7 @@ export class GmailPipeSource implements PipeSource {
   }
 
   private buildQuery(): string {
-    return 'is:unread category:primary';
+    return 'is:unread';
   }
 
   private async pollForMessages(): Promise<void> {
@@ -220,20 +220,7 @@ export class GmailPipeSource implements PipeSource {
       timestamp,
     });
 
-    if (handled) {
-      try {
-        await this.gmail.users.messages.modify({
-          userId: 'me',
-          id: messageId,
-          requestBody: { removeLabelIds: ['UNREAD'] },
-        });
-      } catch (err) {
-        logger.warn(
-          { messageId, err, source: this.sourceName },
-          'Failed to mark email as read',
-        );
-      }
-    } else {
+    if (!handled) {
       logger.debug(
         { messageId, source: this.sourceName, subject },
         'Pipe source event was unhandled; leaving email unread',
@@ -250,24 +237,49 @@ export class GmailPipeSource implements PipeSource {
     payload: gmail_v1.Schema$MessagePart | undefined,
   ): string {
     if (!payload) return '';
+    return this.extractPlainText(payload) || this.extractHtmlAsText(payload);
+  }
 
+  private extractPlainText(payload: gmail_v1.Schema$MessagePart): string {
     if (payload.mimeType === 'text/plain' && payload.body?.data) {
       return Buffer.from(payload.body.data, 'base64').toString('utf-8');
     }
-
     if (payload.parts) {
       for (const part of payload.parts) {
         if (part.mimeType === 'text/plain' && part.body?.data) {
           return Buffer.from(part.body.data, 'base64').toString('utf-8');
         }
       }
-
       for (const part of payload.parts) {
-        const text = this.extractTextBody(part);
+        const text = this.extractPlainText(part);
         if (text) return text;
       }
     }
+    return '';
+  }
 
+  private extractHtmlAsText(payload: gmail_v1.Schema$MessagePart): string {
+    if (payload.mimeType === 'text/html' && payload.body?.data) {
+      const html = Buffer.from(payload.body.data, 'base64').toString('utf-8');
+      return html
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/g, '"')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+    if (payload.parts) {
+      for (const part of payload.parts) {
+        const text = this.extractHtmlAsText(part);
+        if (text) return text;
+      }
+    }
     return '';
   }
 }
