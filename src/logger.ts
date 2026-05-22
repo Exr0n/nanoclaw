@@ -11,6 +11,11 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
+// Exit on unhandled rejection so launchd's KeepAlive restarts us cleanly.
+// Staying up after an unhandled rejection has burned us — e.g. a startup-time
+// DNS miss for discord.com left the bot offline for hours because the process
+// kept running but Discord never reconnected.
 process.on('unhandledRejection', (reason) => {
-  logger.error({ err: reason }, 'Unhandled rejection');
+  logger.fatal({ err: reason }, 'Unhandled rejection — exiting for restart');
+  process.exit(1);
 });
