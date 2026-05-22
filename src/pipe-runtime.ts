@@ -438,7 +438,25 @@ class PipeRuntime {
       const archiveDir = path.join(dir, 'archive');
       fs.mkdirSync(archiveDir, { recursive: true });
       const archiveName = `${Date.now()}-${path.basename(pipe.filePath)}`;
-      fs.renameSync(pipe.filePath, path.join(archiveDir, archiveName));
+      const archivePath = path.join(archiveDir, archiveName);
+
+      // Prepend execution history comment before archiving
+      const archivedAt = new Date().toISOString();
+      const historyComment = [
+        `// ─────────────────────────────────────────────────────────────`,
+        `// ARCHIVED: ${archivedAt}`,
+        `// Pipe: ${pipe.id}`,
+        `// Ran: ${pipe.runCount} time${pipe.runCount !== 1 ? 's' : ''}`,
+        `// ─────────────────────────────────────────────────────────────`,
+        ``,
+      ].join('\n');
+
+      const originalSource = fs.existsSync(pipe.filePath)
+        ? fs.readFileSync(pipe.filePath, 'utf-8')
+        : '';
+      fs.writeFileSync(archivePath, historyComment + originalSource, 'utf-8');
+      if (fs.existsSync(pipe.filePath)) fs.unlinkSync(pipe.filePath);
+
       logger.info({ archived: archiveName, id: pipe.id }, 'Pipe archived');
     } catch {
       logger.info({ id: pipe.id }, 'Pipe unregistered');
