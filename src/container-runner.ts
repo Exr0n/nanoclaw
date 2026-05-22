@@ -110,6 +110,27 @@ function buildVolumeMounts(
       containerPath: '/workspace/group',
       readonly: false,
     });
+
+    // Main can edit pipe infrastructure (runtime + sources) so the agent
+    // can fix/extend how pipes are fed and executed. Everything else under
+    // src/ stays read-only via the mount above. Applying edits still needs
+    // a host-side `npm run build` + service restart.
+    const pipeRuntimeFile = path.join(projectRoot, 'src', 'pipe-runtime.ts');
+    if (fs.existsSync(pipeRuntimeFile)) {
+      mounts.push({
+        hostPath: pipeRuntimeFile,
+        containerPath: '/workspace/project/src/pipe-runtime.ts',
+        readonly: false,
+      });
+    }
+    const pipeSourcesDir = path.join(projectRoot, 'src', 'pipe-sources');
+    if (fs.existsSync(pipeSourcesDir)) {
+      mounts.push({
+        hostPath: pipeSourcesDir,
+        containerPath: '/workspace/project/src/pipe-sources',
+        readonly: false,
+      });
+    }
   } else {
     // Other groups only get their own folder
     mounts.push({

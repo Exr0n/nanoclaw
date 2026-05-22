@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -454,6 +455,36 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'rebuild_restart': {
+      // Only main can trigger a host rebuild+restart of NanoClaw itself.
+      // Used after the agent edits pipe infrastructure (src/pipe-runtime.ts,
+      // src/pipe-sources/*) so new TypeScript gets compiled to dist/ and
+      // the LaunchAgent's KeepAlive restarts the process.
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized rebuild_restart attempt blocked',
+        );
+        break;
+      }
+      logger.info({ sourceGroup }, 'rebuild_restart requested via IPC');
+      const build = spawn('npm', ['run', 'build'], {
+        cwd: process.cwd(),
+        stdio: 'inherit',
+      });
+      build.on('close', (code) => {
+        if (code === 0) {
+          logger.info(
+            'rebuild_restart: build succeeded, exiting for KeepAlive restart',
+          );
+          process.exit(0);
+        } else {
+          logger.error({ code }, 'rebuild_restart: build failed, staying up');
+        }
+      });
+      break;
+    }
 
     case 'send_sms': {
       const { sendSms: sms } = await import('./sms.js');
